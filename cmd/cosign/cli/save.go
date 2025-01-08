@@ -24,6 +24,7 @@ import (
 	"github.com/sigstore/cosign/v2/cmd/cosign/cli/options"
 	"github.com/sigstore/cosign/v2/pkg/oci"
 	"github.com/sigstore/cosign/v2/pkg/oci/layout"
+	ociplatform "github.com/sigstore/cosign/v2/pkg/oci/platform"
 	ociremote "github.com/sigstore/cosign/v2/pkg/oci/remote"
 	"github.com/spf13/cobra"
 )
@@ -50,6 +51,7 @@ func Save() *cobra.Command {
 func SaveCmd(ctx context.Context, opts options.SaveOptions, imageRef string) error {
 	regOpts := opts.Registry
 	regClientOpts, err := regOpts.ClientOpts(ctx)
+	regClientOpts = append(regClientOpts, ociremote.WithCachePath(opts.CachePath))
 	if err != nil {
 		return fmt.Errorf("constructing client options: %w", err)
 	}
@@ -64,12 +66,17 @@ func SaveCmd(ctx context.Context, opts options.SaveOptions, imageRef string) err
 		return fmt.Errorf("signed entity: %w", err)
 	}
 
+	se, err = ociplatform.SignedEntityForPlatform(se, opts.Platform)
+	if err != nil {
+		return err
+	}
+
 	if _, ok := se.(oci.SignedImage); ok {
 		si, err := ociremote.SignedImage(ref, regClientOpts...)
 		if err != nil {
 			return fmt.Errorf("getting signed image: %w", err)
 		}
-		return layout.WriteSignedImage(opts.Directory, si)
+		return layout.WriteSignedImage(opts.Directory, si, ref)
 	}
 
 	if _, ok := se.(oci.SignedImageIndex); ok {
@@ -77,7 +84,8 @@ func SaveCmd(ctx context.Context, opts options.SaveOptions, imageRef string) err
 		if err != nil {
 			return fmt.Errorf("getting signed image index: %w", err)
 		}
-		return layout.WriteSignedImageIndex(opts.Directory, sii)
+		return layout.WriteSignedImageIndex(opts.Directory, sii, ref)
 	}
+
 	return errors.New("unknown signed entity")
 }
