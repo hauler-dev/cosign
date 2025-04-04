@@ -18,6 +18,7 @@ package cli
 import (
 	"context"
 	"fmt"
+ 	"strings"
 
 	"github.com/google/go-containerregistry/pkg/name"
 
@@ -26,6 +27,8 @@ import (
 	"github.com/sigstore/cosign/v2/pkg/oci/remote"
 
 	"github.com/spf13/cobra"
+
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 func Load() *cobra.Command {
@@ -79,8 +82,34 @@ func LoadCmd(ctx context.Context, opts options.LoadOptions, imageRef string) err
 		return err
 	}
 
-	if opts.Registry.Name == "" {
-		return remote.WriteSignedImageIndexImages(ref, sii, ociremoteOpts...)
+	loadTags, err := parseOnlyOpt(opts.LoadOnly)
+	if err != nil {
+		return err
 	}
-	return remote.WriteSignedImageIndexImagesBulk(opts.Registry.Name, sii, ociremoteOpts...)
+
+	if opts.Registry.Name == "" {
+		return remote.WriteSignedImageIndexImages(ref, loadTags, sii, ociremoteOpts...)
+	}
+	return remote.WriteSignedImageIndexImagesBulk(opts.Registry.Name, loadTags, sii, ociremoteOpts...)
+}
+
+func parseOnlyOpt(onlyFlag string) (sets.Set[string], error) {
+	validTags := sets.New("sig", "sbom", "att")
+
+	// If no tags are provided, default to all
+	tagSet := validTags
+	if len(onlyFlag) > 0 {
+		tagSet = sets.New(strings.Split(onlyFlag, ",")...)
+	} else {
+		tagSet = validTags
+	}
+
+	// validate the provided tags
+	for tag := range tagSet {
+		if !validTags.Has(tag) {
+			return nil, fmt.Errorf("invalid value for --only: %s, only following values are supported, %s", tag, validTags)
+		}
+	}
+
+	return tagSet, nil
 }
