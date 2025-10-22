@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/logs"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	goremote "github.com/google/go-containerregistry/pkg/v1/remote"
@@ -32,8 +33,10 @@ import (
 	ociexperimental "github.com/sigstore/cosign/v3/internal/pkg/oci/remote"
 	"github.com/sigstore/cosign/v3/pkg/cosign/bundle"
 	"github.com/sigstore/cosign/v3/pkg/oci"
+	"github.com/sigstore/cosign/v3/pkg/oci/layout"
 	ctypes "github.com/sigstore/cosign/v3/pkg/types"
 	sgbundle "github.com/sigstore/sigstore-go/pkg/bundle"
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 const BundlePredicateType string = "dev.sigstore.bundle.predicateType"
@@ -42,7 +45,7 @@ const BundlePredicateType string = "dev.sigstore.bundle.predicateType"
 // This includes the signed image and associated signatures in the image index
 // TODO (priyawadhwa@): write the `index.json` itself to the repo as well
 // TODO (priyawadhwa@): write the attestations
-func WriteSignedImageIndexImages(ref name.Reference, sii oci.SignedImageIndex, directory string, opts ...Option) error {
+func WriteSignedImageIndexImages(ref name.Reference, loadTags sets.Set[string], sii oci.SignedImageIndex, directory string, opts ...Option) error {
 	repo := ref.Context()
 	o := makeOptions(repo, opts...)
 
@@ -69,32 +72,54 @@ func WriteSignedImageIndexImages(ref name.Reference, sii oci.SignedImageIndex, d
 	}
 
 	// write the signatures
-	sigs, err := sii.Signatures()
-	if err != nil {
-		return err
-	}
-	if sigs != nil { // will be nil if there are no associated signatures
-		sigsTag, err := SignatureTag(ref, opts...)
+	if loadTags.Has("sig") {
+		sigs, err := sii.Signatures()
 		if err != nil {
-			return fmt.Errorf("sigs tag: %w", err)
-		}
-		if err := remoteWrite(sigsTag, sigs, o.ROpt...); err != nil {
 			return err
+		}
+		if sigs != nil { // will be nil if there are no associated signatures
+			sigsTag, err := SignatureTag(ref, opts...)
+			if err != nil {
+				return fmt.Errorf("sigs tag: %w", err)
+			}
+			if err := remoteWrite(sigsTag, sigs, o.ROpt...); err != nil {
+				return err
+			}
 		}
 	}
 
 	// write the attestations
-	atts, err := sii.Attestations()
-	if err != nil {
-		return err
-	}
-	if atts != nil { // will be nil if there are no associated attestations
-		attsTag, err := AttestationTag(ref, opts...)
+	if loadTags.Has("att") {
+		atts, err := sii.Attestations()
 		if err != nil {
-			return fmt.Errorf("sigs tag: %w", err)
+			return err
 		}
-		return remoteWrite(attsTag, atts, o.ROpt...)
+		if atts != nil { // will be nil if there are no associated attestations
+			attsTag, err := AttestationTag(ref, opts...)
+			if err != nil {
+				return fmt.Errorf("sigs tag: %w", err)
+			}
+			return remoteWrite(attsTag, atts, o.ROpt...)
+		}
 	}
+
+    // write the attachments
+    // implementing sboms for starters
+    if loadTags.Has("sbom") {
+        sboms, err := sii.Attachment("sbom")
+        if err != nil {
+            return err
+        }
+        if sboms != nil { // will be nil if there are no associated sboms
+            sbomTag, err := SBOMTag(ref, opts...)
+            if err != nil {
+                return fmt.Errorf("sbom tag: %w", err)
+            }
+            if err := remoteWrite(sbomTag, sboms, o.ROpt...); err != nil {
+                return err
+            }
+        }
+    }
 
 	// Look for any referring artifacts
 	digest, ok := ref.(name.Digest)
@@ -161,6 +186,213 @@ func WriteSignedImageIndexImages(ref name.Reference, sii oci.SignedImageIndex, d
 				}
 			}
 		}
+	}
+
+	return nil
+}
+
+// WriteSignedImageIndexImagesBulk writes the images within the image index.
+// Bulk version.  Uses targetRegistry for multiple images/sigs/atts.
+// This includes the signed image and associated signatures in the image index
+func WriteSignedImageIndexImagesBulk(ref name.Reference, targetRegistry string, loadTags sets.Set[string], sii oci.SignedImageIndex, directory string, opts ...Option) error {
+	// enable the progress logs to be printed to stdout
+	logs.Progress.SetOutput(os.Stdout)
+
+	// loop through all of the items in the manifest
+	manifest, err := sii.IndexManifest()
+	if err != nil {
+		return err
+	}
+	for _, m := range manifest.Manifests {
+		// write image index if exists
+		if val, ok := m.Annotations[layout.KindAnnotation]; ok && val == layout.ImageIndexAnnotation {
+			imgTitle := m.Annotations[layout.ImageRefAnnotation]
+			fmt.Println(imgTitle)
+			si, err := sii.SignedImageIndex(m.Digest)
+			if err != nil {
+				return fmt.Errorf("signed image index: %w", err)
+			}
+			if si != nil {
+				ref, err := name.ParseReference(targetRegistry + "/" + imgTitle)
+				if err != nil {
+					return fmt.Errorf("creating new reference: %w", err)
+				}
+				repo := ref.Context()
+				o := makeOptions(repo, opts...)
+				if err := goremote.WriteIndex(ref, si, o.ROpt...); err != nil {
+					return fmt.Errorf("writing index: %w", err)
+				}
+			}
+		}
+
+		// write any images
+		if val, ok := m.Annotations[layout.KindAnnotation]; ok && val == layout.ImageAnnotation {
+			imgTitle := m.Annotations[layout.ImageRefAnnotation]
+			fmt.Println(imgTitle)
+			si, err := sii.SignedImage(m.Digest)
+			if err != nil {
+				return fmt.Errorf("signed image: %w", err)
+			}
+			if si != nil {
+				ref, err := name.ParseReference(targetRegistry + "/" + imgTitle)
+				if err != nil {
+					return fmt.Errorf("creating new reference: %w", err)
+				}
+				repo := ref.Context()
+				o := makeOptions(repo, opts...)
+				if err := remoteWrite(ref, si, o.ROpt...); err != nil {
+					return fmt.Errorf("remote write: %w", err)
+				}
+			}
+		}
+
+		// write the signatures
+		if loadTags.Has("sig") {
+			if val, ok := m.Annotations[layout.KindAnnotation]; ok && val == layout.SigsAnnotation {
+				imgTitle := m.Annotations[layout.ImageRefAnnotation]
+				sigs, err := sii.SignedImage(m.Digest)
+				if err != nil {
+					return err
+				}
+				if sigs != nil { // will be nil if there are no associated signatures
+					ref, err := name.ParseReference(targetRegistry + "/" + imgTitle)
+					if err != nil {
+						return err
+					}
+					sigsTag, err := SignatureTag(ref, opts...)
+					if err != nil {
+						return fmt.Errorf("sigs tag: %w", err)
+					}
+					repo := ref.Context()
+					o := makeOptions(repo, opts...)
+					if err := remoteWrite(sigsTag, sigs, o.ROpt...); err != nil {
+						return err
+					}
+				}
+			}
+		}
+
+		// write the attestations
+		if loadTags.Has("att") {
+			if val, ok := m.Annotations[layout.KindAnnotation]; ok && val == layout.AttsAnnotation {
+				imgTitle := m.Annotations[layout.ImageRefAnnotation]
+				atts, err := sii.SignedImage(m.Digest)
+				if err != nil {
+					return err
+				}
+				if atts != nil { // will be nil if there are no associated attestations
+					ref, err := name.ParseReference(targetRegistry + "/" + imgTitle)
+					if err != nil {
+						return err
+					}
+					attsTag, err := AttestationTag(ref, opts...)
+					if err != nil {
+						return fmt.Errorf("sigs tag: %w", err)
+					}
+					repo := ref.Context()
+					o := makeOptions(repo, opts...)
+					if err := remoteWrite(attsTag, atts, o.ROpt...); err != nil {
+						return err
+					}
+				}
+			}
+		}
+
+		// write the sboms
+		if loadTags.Has("sbom") {
+			if val, ok := m.Annotations[layout.KindAnnotation]; ok && val == layout.SbomsAnnotation {
+				imgTitle := m.Annotations[layout.ImageRefAnnotation]
+				sboms, err := sii.SignedImage(m.Digest)
+				if err != nil {
+					return err
+				}
+				if sboms != nil { // will be nil if there are no associated attestations
+					ref, err := name.ParseReference(targetRegistry + "/" + imgTitle)
+					if err != nil {
+						return err
+					}
+					sbomsTag, err := SBOMTag(ref, opts...)
+					if err != nil {
+						return fmt.Errorf("sboms tag: %w", err)
+					}
+					repo := ref.Context()
+					o := makeOptions(repo, opts...)
+					if err := remoteWrite(sbomsTag, sboms, o.ROpt...); err != nil {
+						return err
+					}
+				}
+			}
+		}
+
+		// Look for any referring artifacts
+		repo := ref.Context()
+		o := makeOptions(repo, opts...)
+		digest, ok := ref.(name.Digest)
+		if !ok {
+			var err error
+			digest, err = ResolveDigest(ref, opts...)
+			if err != nil {
+				return fmt.Errorf("resolving digest: %w", err)
+			}
+		}
+		blobPath := filepath.Join(directory, "blobs", "sha256")
+
+		files, err := os.ReadDir(blobPath)
+		if err != nil {
+			return err
+		}
+
+		for _, file := range files {
+			fd, err := os.Open(filepath.Join(blobPath, file.Name()))
+			if err != nil {
+				return err
+			}
+			manifest, err := v1.ParseManifest(fd)
+			if err != nil || manifest.Subject == nil {
+				continue
+			}
+			if strings.Compare(manifest.Subject.Digest.String(), digest.DigestStr()) == 0 {
+				// Get the predicate type
+				predicateType := ""
+				if manifest.Annotations != nil {
+					if v, ok := manifest.Annotations[BundlePredicateType]; ok {
+						predicateType = v
+					}
+				}
+				if predicateType != "" {
+					// Write the empty layer
+					_, _, err := writeEmptyConfigLayer(o)
+					if err != nil {
+						return err
+					}
+
+					// Write the manifest
+					m := referrerManifest{*manifest, bundle.BundleV03MediaType}
+					targetRef, err := m.targetRef(o.TargetRepository, opts...)
+					if err != nil {
+						return fmt.Errorf("failed to create target reference: %w", err)
+					}
+					if err := remotePut(targetRef, m, o.ROpt...); err != nil {
+						return fmt.Errorf("failed to upload manifest: %w", err)
+					}
+
+					// Write bundle layers
+					for _, layer := range manifest.Layers {
+						bundlePath := filepath.Join(directory, "blobs", "sha256", layer.Digest.Hex)
+						bundleBytes, err := os.ReadFile(bundlePath)
+						if err != nil {
+							return err
+						}
+						layer := static.NewLayer(bundleBytes, types.MediaType(bundle.BundleV03MediaType))
+						err = remoteWriteLayer(o.TargetRepository, layer, o.ROpt...)
+						if err != nil {
+							return err
+						}
+					}
+				}
+			}
+		}
+
 	}
 
 	return nil
