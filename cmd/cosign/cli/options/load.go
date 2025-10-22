@@ -22,6 +22,7 @@ import (
 // LoadOptions is the top level wrapper for the load command.
 type LoadOptions struct {
 	Directory string
+	LoadOnly  string
 	Registry  RegistryOptions
 }
 
@@ -34,4 +35,11 @@ func (o *LoadOptions) AddFlags(cmd *cobra.Command) {
 		"path to directory where the signed image is stored on disk")
 	_ = cmd.MarkFlagDirname("dir")
 	_ = cmd.MarkFlagRequired("dir")
+
+	cmd.Flags().StringVar(&o.Registry.Name, "registry", "",
+		"registry to use for bulk load")
+	_ = cmd.Flags().SetAnnotation("registry", cobra.BashCompSubdirsInDir, []string{})
+
+	cmd.Flags().StringVar(&o.LoadOnly, "only", "",
+	"custom string array to only load specific items, this flag is comma delimited. ex: --only=sig,att,sbom")
 }
